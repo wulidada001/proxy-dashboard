@@ -1,0 +1,254 @@
+from flask import Flask, jsonify
+import subprocess
+import time
+import requests
+import threading
+from datetime import datetime
+
+app = Flask(__name__)
+
+# 生成 254 个代理配置：30000-30253 对应 31.58.239.1-31.58.239.254
+PROXIES = [
+    {"port": port, "ip": f"31.58.239.{port - 29999}"}
+    for port in range(30000, 30254)
+]
+
+# 全局缓存数据
+RESULTS = {}
+LAST_UPDATE_TS = 0
+CHECK_INTERVAL_SECONDS = 60  # 后台检查间隔
+
+
+def get_conn_count(port: int) -> int:
+    """统计端口当前连接数（ESTAB）"""
+    try:
+        out = subprocess.check_output(
+            ["ss", "-nt", "sport", f"=:{port}"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        lines = [l for l in out.strip().splitlines() if l.strip()]
+        if len(lines) <= 1:
+            return 0
+        return len(lines) - 1
+    except:
+        return 0
+
+
+def get_geo(ip: str):
+    """获取国家、城市归属地"""
+    try:
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=3)
+        js = r.json()
+        return js.get("country", "-"), js.get("city", "-")
+    except:
+        return "-", "-"
+
+
+def check_single_proxy(port: int, ip: str, last_ok_ts: float | None = None):
+    """检查单个代理健康状态"""
+    user_index = port - 29999
+    proxy_auth = f"user{user_index}:pass{user_index}"
+    proxy_url = f"http://{proxy_auth}@127.0.0.1:{port}"
+    proxies = {"http": proxy_url, "https": proxy_url}
+
+    now = time.time()
+    try:
+        start = time.time()
+        r = requests.get("https://ipinfo.io/ip", proxies=proxies, timeout=3)
+        delay = int((time.time() - start) * 1000)
+        real_ip = r.text.strip()
+        online = True
+        last_ok_ts = now
+    except:
+        delay = None
+        real_ip = None
+        online = False
+
+    conn_count = get_conn_count(port)
+    country, city = get_geo(real_ip) if real_ip else ("-", "-")
+
+    return {
+        "port": port,
+        "expected_ip": ip,
+        "real_ip": real_ip,
+        "delay_ms": delay,
+        "online": online,
+        "conn_count": conn_count,
+        "country": country,
+        "city": city,
+        "last_ok_ts": last_ok_ts,
+        "last_ok": (
+            datetime.fromtimestamp(last_ok_ts).strftime("%Y-%m-%d %H:%M:%S")
+            if last_ok_ts else None
+        ),
+        "ip_mismatch": bool(real_ip and real_ip != ip)
+    }
+
+
+def background_worker():
+    global RESULTS, LAST_UPDATE_TS
+
+    while True:
+        new_results = {}
+        old = RESULTS.copy()
+
+        for cfg in PROXIES:
+            port = cfg["port"]
+            ip = cfg["ip"]
+            last_ok_ts = old.get(port, {}).get("last_ok_ts")
+            item = check_single_proxy(port, ip, last_ok_ts)
+            new_results[port] = item
+
+        RESULTS = new_results
+        LAST_UPDATE_TS = time.time()
+        time.sleep(CHECK_INTERVAL_SECONDS)
+
+
+@app.route("/api/status")
+def api_status():
+    global RESULTS, LAST_UPDATE_TS
+
+    if not RESULTS:
+        tmp = {}
+        for cfg in PROXIES:
+            port = cfg["port"]
+            ip = cfg["ip"]
+            item = check_single_proxy(port, ip)
+            tmp[port] = item
+        RESULTS = tmp
+        LAST_UPDATE_TS = time.time()
+
+    data = list(sorted(RESULTS.values(), key=lambda x: x["port"]))
+
+    summary = {
+        "total": len(data),
+        "online": sum(1 for d in data if d["online"]),
+        "offline": sum(1 for d in data if not d["online"]),
+        "mismatch": sum(1 for d in data if d["ip_mismatch"]),
+        "last_update": datetime.fromtimestamp(LAST_UPDATE_TS).strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    return jsonify({"summary": summary, "proxies": data})
+
+
+@app.route("/")
+def index():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Proxy Dashboard</title>
+<style>
+body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+table { border-collapse: collapse; width: 100%; background: #fff; }
+th, td { border: 1px solid #ddd; padding: 6px 4px; text-align: center; }
+.ok { background: #e7f9e7; }
+.bad { background: #fde4e4; }
+.warn { background: #fff7d6; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+<h2>Proxy Dashboard</h2>
+<small>每 10 秒刷新一次 · 自动监控 · Geo 归属地 · 图表</small>
+
+<div id="summary" style="margin:10px 0; font-size:14px;"></div>
+
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>状态</th>
+<th>出口 IP</th>
+<th>归属地</th>
+<th>延迟 (ms)</th>
+<th>连接数</th>
+<th>最近成功</th>
+</tr>
+</thead>
+<tbody id="tbody"></tbody>
+</table>
+
+<br>
+
+<canvas id="chartOnline" height="120"></canvas>
+<br>
+<canvas id="chartLatency" height="150"></canvas>
+
+<script>
+async function load() {
+    const r = await fetch('/api/status');
+    const js = await r.json();
+
+    document.getElementById('summary').innerHTML =
+        `总数: ${js.summary.total} · 在线: ${js.summary.online} · 离线: ${js.summary.offline} · IP异常: ${js.summary.mismatch} · 最近更新: ${js.summary.last_update}`;
+
+    const tbody = document.getElementById('tbody');
+    tbody.innerHTML = "";
+
+    let onlineData = js.summary.online;
+    let offlineData = js.summary.offline;
+
+    let latLabels = [];
+    let latData = [];
+
+    js.proxies.forEach((p, idx) => {
+        const tr = document.createElement('tr');
+
+        let cls = p.online ? 'ok' : 'bad';
+        if (p.ip_mismatch) cls = 'warn';
+
+        tr.className = cls;
+
+        tr.innerHTML = `
+            <td>${p.port}</td>
+            <td>${p.online ? "在线" : "离线"}</td>
+            <td>${p.real_ip || "-"}</td>
+            <td>${p.country} / ${p.city}</td>
+            <td>${p.delay_ms || "-"}</td>
+            <td>${p.conn_count}</td>
+            <td>${p.last_ok || "-"}</td>
+        `;
+        tbody.appendChild(tr);
+
+        if (idx < 20) {
+            latLabels.push(p.port);
+            latData.push(p.delay_ms || 0);
+        }
+    });
+
+    new Chart(document.getElementById('chartOnline'), {
+        type: 'pie',
+        data: {
+            labels: ['在线', '离线'],
+            datasets: [{ data: [onlineData, offlineData] }]
+        }
+    });
+
+    new Chart(document.getElementById('chartLatency'), {
+        type: 'bar',
+        data: {
+            labels: latLabels,
+            datasets: [{
+                label: '前 20 端口延迟',
+                data: latData
+            }]
+        }
+    });
+}
+
+setInterval(load, 10000);
+load();
+</script>
+
+</body>
+</html>
+    """
+
+
+if __name__ == "__main__":
+    threading.Thread(target=background_worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=5000)

@@ -1,0 +1,108 @@
+from flask import Flask, jsonify
+import subprocess, time, requests
+
+app = Flask(__name__)
+
+# 自动生成 254 个代理
+PROXIES = [
+    {"port": 30000 + i, "ip": f"31.58.239.{1+i}"}
+    for i in range(254)
+]
+
+def check_proxy(port, ip):
+    user = f"user{port-29999}"
+    pwd  = f"pass{port-29999}"
+
+    proxy_url = f"http://{user}:{pwd}@45.32.48.224:{port}"  # 使用你的真实 IP
+
+    try:
+        start = time.time()
+        r = requests.get("https://ipinfo.io/ip",
+                         proxies={"http": proxy_url, "https": proxy_url},
+                         timeout=2)
+
+        delay = int((time.time() - start) * 1000)
+
+        return {
+            "port": port,
+            "expected_ip": ip,
+            "real_ip": r.text.strip(),
+            "delay_ms": delay,
+            "online": True
+        }
+    except:
+        return {
+            "port": port,
+            "expected_ip": ip,
+            "real_ip": None,
+            "delay_ms": None,
+            "online": False
+        }
+
+@app.route("/api/status")
+def api_status():
+    result = [check_proxy(p["port"], p["ip"]) for p in PROXIES]
+    return jsonify(result)
+
+@app.route("/")
+def index():
+    return """
+    <html>
+    <head>
+    <style>
+    body { font-family: Arial; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+    .ok { background: #c8f7c5; }
+    .bad { background: #f1a9a0; }
+    </style>
+    </head>
+    <body>
+    <h2>Proxy Dashboard</h2>
+    <p>Auto Refresh Every 5 Seconds</p>
+    <table id="tb">
+        <tr>
+            <th>Port</th>
+            <th>状态</th>
+            <th>出口 IP</th>
+            <th>延迟 (ms)</th>
+        </tr>
+    </table>
+
+    <script>
+    function load(){
+        fetch('/api/status').then(r => r.json()).then(data => {
+            let tb = document.getElementById("tb");
+            let rows = "";
+
+            data.forEach(p => {
+                rows += `
+                    <tr class="${p.online ? 'ok' : 'bad'}">
+                        <td>${p.port}</td>
+                        <td>${p.online ? '在线' : '离线'}</td>
+                        <td>${p.real_ip || '-'}</td>
+                        <td>${p.delay_ms || '-'}</td>
+                    </tr>
+                `;
+            });
+
+            tb.innerHTML = `
+                <tr>
+                    <th>Port</th>
+                    <th>状态</th>
+                    <th>出口 IP</th>
+                    <th>延迟 (ms)</th>
+                </tr>
+                ` + rows;
+        });
+    }
+
+    load();
+    setInterval(load, 5000);
+    </script>
+    </body>
+    </html>
+    """
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
